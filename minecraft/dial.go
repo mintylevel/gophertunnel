@@ -10,6 +10,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
+	rand2 "math/rand"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/go-jose/go-jose/v3/jwt"
 	"github.com/google/uuid"
 	"github.com/sandertv/go-raknet"
@@ -18,13 +26,6 @@ import (
 	"github.com/sandertv/gophertunnel/minecraft/protocol/login"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 	"golang.org/x/oauth2"
-	"log"
-	rand2 "math/rand"
-	"net"
-	"os"
-	"strconv"
-	"strings"
-	"time"
 )
 
 // Dialer allows specifying specific settings for connection to a Minecraft server.
@@ -72,6 +73,9 @@ type Dialer struct {
 	// packets with too many bytes will be returned while packets with too few bytes will be skipped.
 	DisconnectOnInvalidPackets bool
 
+	// ReadBatches is an option if you want to read batches instead of individual packets.
+	ReadBatches bool
+
 	// Protocol is the Protocol version used to communicate with the target server. By default, this field is
 	// set to the current protocol as implemented in the minecraft/protocol package. Note that packets written
 	// to and read from the Conn are always any of those found in the protocol/packet package, as packets
@@ -85,6 +89,8 @@ type Dialer struct {
 	// will not be flushed automatically. In this case, calling `(*Conn).Flush()` is required after any
 	// calls to `(*Conn).Write()` or `(*Conn).WritePacket()` to send the packets over network.
 	FlushRate time.Duration
+
+	IPAddress string
 
 	// EnableClientCache, if set to true, enables the client blob cache for the client. This means that the
 	// server will send chunks as blobs, which may be saved by the client so that chunks don't have to be
@@ -183,7 +189,7 @@ func (d Dialer) DialContext(ctx context.Context, network, address string) (conn 
 		return nil, err
 	}
 
-	conn = newConn(netConn, key, d.ErrorLog, d.Protocol, d.FlushRate, false)
+	conn = newConn(netConn, key, d.ErrorLog, d.Protocol, d.FlushRate, false, d.ReadBatches)
 	conn.pool = conn.proto.Packets(false)
 	conn.identityData = d.IdentityData
 	conn.clientData = d.ClientData
@@ -224,12 +230,26 @@ func (d Dialer) DialContext(ctx context.Context, network, address string) (conn 
 	if err := conn.WritePacket(&packet.RequestNetworkSettings{ClientProtocol: d.Protocol.ID()}); err != nil {
 		return nil, err
 	}
-	_ = conn.Flush()
+
+	fchan := make(chan bool, 1)
+	go func() {
+		t := time.NewTicker(time.Millisecond * 50)
+		for {
+			select {
+			case <-t.C:
+				conn.Flush()
+			case <-fchan:
+				return
+			}
+		}
+	}()
 
 	select {
 	case <-conn.close:
+		fchan <- true
 		return nil, conn.closeErr("dial")
 	case <-ctx.Done():
+		fchan <- true
 		return nil, conn.wrap(ctx.Err(), "dial")
 	case <-l:
 		// We've received our network settings, so we can now send our login request.
@@ -241,10 +261,13 @@ func (d Dialer) DialContext(ctx context.Context, network, address string) (conn 
 
 		select {
 		case <-conn.close:
+			fchan <- true
 			return nil, conn.closeErr("dial")
 		case <-ctx.Done():
+			fchan <- true
 			return nil, conn.wrap(ctx.Err(), "dial")
 		case <-c:
+			fchan <- true
 			// We've connected successfully. We return the connection and no error.
 			return conn, nil
 		}
@@ -291,6 +314,29 @@ func listenConn(conn *Conn, logger *log.Logger, l, c chan struct{}) {
 			}
 			return
 		}
+
+		if conn.readBatches {
+			loggedInBefore, readyToLoginBefore := conn.loggedIn, conn.readyToLogin
+			if err := conn.receiveMultiple(packets); err != nil {
+				logger.Printf("error: %v", err)
+				return
+			}
+
+			if !readyToLoginBefore && conn.readyToLogin {
+				// This is the signal that the connection is ready to login, so we put a value in the channel so that
+				// it may be detected.
+				l <- struct{}{}
+			}
+
+			if !loggedInBefore && conn.loggedIn {
+				// This is the signal that the connection was considered logged in, so we put a value in the channel so
+				// that it may be detected.
+				c <- struct{}{}
+			}
+
+			continue
+		}
+
 		for _, data := range packets {
 			loggedInBefore, readyToLoginBefore := conn.loggedIn, conn.readyToLogin
 			if err := conn.receive(data); err != nil {

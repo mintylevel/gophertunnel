@@ -5,15 +5,16 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"fmt"
-	"github.com/sandertv/go-raknet"
-	"github.com/sandertv/gophertunnel/minecraft/protocol"
-	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
-	"github.com/sandertv/gophertunnel/minecraft/resource"
 	"log"
 	"net"
 	"os"
 	"sync/atomic"
 	"time"
+
+	"github.com/sandertv/go-raknet"
+	"github.com/sandertv/gophertunnel/minecraft/protocol"
+	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
+	"github.com/sandertv/gophertunnel/minecraft/resource"
 )
 
 // ListenConfig holds settings that may be edited to change behaviour of a Listener.
@@ -61,6 +62,9 @@ type ListenConfig struct {
 	// will not be flushed automatically. In this case, calling `(*Conn).Flush()` is required after any
 	// calls to `(*Conn).Write()` or `(*Conn).WritePacket()` to send the packets over network.
 	FlushRate time.Duration
+	// ReadBatches determines whether packets should be retrieved in conn's batches. When enabled, the conn.ReadBatch()
+	// function should be used as opposed to conn.ReadPacket()
+	ReadBatches bool
 
 	// ResourcePacks is a slice of resource packs that the listener may hold. Each client will be asked to
 	// download these resource packs upon joining.
@@ -134,7 +138,7 @@ func (cfg ListenConfig) Listen(network string, address string) (*Listener, error
 	}
 
 	// Actually start listening.
-	go listener.listen()
+	go listener.listen(n)
 	return listener, nil
 }
 
@@ -194,7 +198,7 @@ func (listener *Listener) updatePongData() {
 
 // listen starts listening for incoming connections and packets. When a player is fully connected, it submits
 // it to the accepted connections channel so that a call to Accept can pick it up.
-func (listener *Listener) listen() {
+func (listener *Listener) listen(n Network) {
 	listener.updatePongData()
 	go func() {
 		ticker := time.NewTicker(time.Second * 4)
@@ -220,18 +224,20 @@ func (listener *Listener) listen() {
 			// close too.
 			return
 		}
-		listener.createConn(netConn)
+		listener.createConn(n, netConn)
 	}
 }
 
 // createConn creates a connection for the net.Conn passed and adds it to the listener, so that it may be
 // accepted once its login sequence is complete.
-func (listener *Listener) createConn(netConn net.Conn) {
-	conn := newConn(netConn, listener.key, listener.cfg.ErrorLog, proto{}, listener.cfg.FlushRate, true)
+func (listener *Listener) createConn(n Network, netConn net.Conn) {
+	conn := newConn(netConn, listener.key, listener.cfg.ErrorLog, proto{}, listener.cfg.FlushRate, true, listener.cfg.ReadBatches)
 	conn.acceptedProto = append(listener.cfg.AcceptedProtocols, proto{})
 	conn.compression = listener.cfg.Compression
 	conn.pool = conn.proto.Packets(true)
-
+	// Temporarily set the protocol to the latest: We don't know the actual protocol until we read the Login packet.
+	conn.proto = proto{}
+	conn.pool = conn.proto.Packets(true)
 	conn.packetFunc = listener.cfg.PacketFunc
 	conn.texturePacksRequired = listener.cfg.TexturePacksRequired
 	conn.resourcePacks = listener.cfg.ResourcePacks
@@ -240,6 +246,11 @@ func (listener *Listener) createConn(netConn net.Conn) {
 	conn.authEnabled = !listener.cfg.AuthenticationDisabled
 	conn.disconnectOnUnknownPacket = !listener.cfg.AllowUnknownPackets
 	conn.disconnectOnInvalidPacket = !listener.cfg.AllowInvalidPackets
+
+	if netConn.(*raknet.Conn).ProtocolVersion() <= 10 {
+		conn.enc.EnableCompression(n.Compression(netConn), true)
+		conn.dec.SetCompression(n.Compression(netConn))
+	}
 
 	if listener.playerCount.Load() == int32(listener.cfg.MaximumPlayers) && listener.cfg.MaximumPlayers != 0 {
 		// The server was full. We kick the player immediately and close the connection.
@@ -280,6 +291,29 @@ func (listener *Listener) handleConn(conn *Conn) {
 			}
 			return
 		}
+
+		if conn.readBatches {
+			loggedInBefore := conn.loggedIn
+			if err := conn.receiveMultiple(packets); err != nil {
+				listener.cfg.ErrorLog.Printf("error: %v", err)
+				return
+			}
+			if !loggedInBefore && conn.loggedIn {
+				select {
+				case <-listener.close:
+					// The listener was closed while this one was logged in, so the incoming channel will be
+					// closed. Just return so the connection is closed and cleaned up.
+					return
+				case listener.incoming <- conn:
+					// The connection was previously not logged in, but was after receiving this packet,
+					// meaning the connection is fully completely now. We add it to the channel so that
+					// a call to Accept() can receive it.
+				}
+			}
+
+			continue
+		}
+
 		for _, data := range packets {
 			loggedInBefore := conn.loggedIn
 			if err := conn.receive(data); err != nil {

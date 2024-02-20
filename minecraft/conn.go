@@ -8,6 +8,14 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"io"
+	"log"
+	"net"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/go-jose/go-jose/v3"
 	"github.com/go-jose/go-jose/v3/jwt"
 	"github.com/google/uuid"
@@ -19,13 +27,6 @@ import (
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 	"github.com/sandertv/gophertunnel/minecraft/resource"
 	"github.com/sandertv/gophertunnel/minecraft/text"
-	"io"
-	"log"
-	"net"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
 // exemptedResourcePack is a resource pack that is exempted from being downloaded. These packs may be directly
@@ -84,6 +85,11 @@ type Conn struct {
 	// packets is a channel of byte slices containing serialised packets that are coming in from the other
 	// side of the connection.
 	packets chan *packetData
+
+	// packetBatches is a channel of byte slices containing a list of serialised packets that are coming in from the
+	// side of the connection.
+	packetBatches chan []*packetData
+	readBatches   bool
 
 	deferredPacketMu sync.Mutex
 	// deferredPackets is a list of packets that were pushed back during the login sequence because they
@@ -148,21 +154,23 @@ type Conn struct {
 // Minecraft packets to that net.Conn.
 // newConn accepts a private key which will be used to identify the connection. If a nil key is passed, the
 // key is generated.
-func newConn(netConn net.Conn, key *ecdsa.PrivateKey, log *log.Logger, proto Protocol, flushRate time.Duration, limits bool) *Conn {
+func newConn(netConn net.Conn, key *ecdsa.PrivateKey, log *log.Logger, proto Protocol, flushRate time.Duration, limits bool, readBatches bool) *Conn {
 	conn := &Conn{
-		enc:          packet.NewEncoder(netConn),
-		dec:          packet.NewDecoder(netConn),
-		salt:         make([]byte, 16),
-		packets:      make(chan *packetData, 8),
-		additional:   make(chan packet.Packet, 16),
-		close:        make(chan struct{}),
-		spawn:        make(chan struct{}),
-		conn:         netConn,
-		privateKey:   key,
-		log:          log,
-		hdr:          &packet.Header{},
-		proto:        proto,
-		readerLimits: limits,
+		enc:           packet.NewEncoder(netConn),
+		dec:           packet.NewDecoder(netConn),
+		salt:          make([]byte, 16),
+		packets:       make(chan *packetData, 8),
+		packetBatches: make(chan []*packetData, 8),
+		additional:    make(chan packet.Packet, 16),
+		close:         make(chan struct{}),
+		spawn:         make(chan struct{}),
+		conn:          netConn,
+		privateKey:    key,
+		log:           log,
+		hdr:           &packet.Header{},
+		proto:         proto,
+		readerLimits:  limits,
+		readBatches:   readBatches,
 	}
 	var s string
 	conn.disconnectMessage.Store(&s)
@@ -173,7 +181,7 @@ func newConn(netConn net.Conn, key *ecdsa.PrivateKey, log *log.Logger, proto Pro
 	}
 	_, _ = rand.Read(conn.salt)
 
-	conn.expectedIDs.Store([]uint32{packet.IDRequestNetworkSettings})
+	conn.expectedIDs.Store([]uint32{packet.IDLogin, packet.IDRequestNetworkSettings})
 
 	if flushRate <= 0 {
 		return conn
@@ -189,6 +197,16 @@ func newConn(netConn net.Conn, key *ecdsa.PrivateKey, log *log.Logger, proto Pro
 		}
 	}()
 	return conn
+}
+
+// Protocol returns the protocol that the connection is using.
+func (conn *Conn) Protocol() Protocol {
+	return conn.proto
+}
+
+// DisconnectReason returns the disconnect message that is stored but never used anywhere for some reason! lolxd
+func (conn *Conn) DisconnectReason() string {
+	return *(conn.disconnectMessage.Load())
 }
 
 // IdentityData returns the identity data of the connection. It holds the UUID, XUID and username of the
@@ -388,6 +406,67 @@ func (conn *Conn) ReadPacket() (pk packet.Packet, err error) {
 	}
 }
 
+// ReadBatch reads a packet batch from the Conn. If a read deadline is set, an error is returned if the deadline is reached before any
+// packet is received. ReadBatch must not be called on multiple goroutines simultaneously.
+//
+// If the packet read was not implemented, a *packet.Unknown is used, containing the raw payload of the packet read.
+func (conn *Conn) ReadBatch() (pks []packet.Packet, err error) {
+	if !conn.readBatches {
+		return nil, fmt.Errorf("reading batches is disabled")
+	}
+
+	var deferred []packet.Packet
+	for {
+		data, ok := conn.takeDeferredPacket()
+		if !ok {
+			break
+		}
+
+		pk, err := data.decode(conn)
+		if err != nil {
+			conn.log.Println(err)
+			continue
+		}
+
+		if len(pk) == 0 {
+			continue
+		}
+
+		deferred = append(deferred, pk...)
+	}
+
+	if len(deferred) > 0 {
+		return deferred, nil
+	}
+
+	select {
+	case <-conn.close:
+		return nil, conn.closeErr("read batch")
+	case <-conn.readDeadline:
+		return nil, conn.wrap(context.DeadlineExceeded, "read batch")
+	case batch := <-conn.packetBatches:
+		for _, data := range batch {
+			pk, err := data.decode(conn)
+			if err != nil {
+				conn.log.Println(err)
+				continue
+			}
+
+			if len(pk) == 0 {
+				continue
+			}
+
+			pks = append(pks, pk...)
+		}
+
+		if len(pks) == 0 {
+			return conn.ReadBatch()
+		}
+
+		return pks, nil
+	}
+}
+
 // ResourcePacks returns a slice of all resource packs the connection holds. For a Conn obtained using a
 // Listener, this holds all resource packs set to the Listener. For a Conn obtained using Dial, the resource
 // packs include all packs sent by the server connected to.
@@ -570,6 +649,9 @@ func (conn *Conn) receive(data []byte) error {
 		_ = conn.Close()
 		return nil
 	}
+	if conn.waitingForSpawn.Load() && pkData.h.PacketID == packet.IDPlayerAuthInput {
+		return nil
+	}
 	if conn.loggedIn && !conn.waitingForSpawn.Load() {
 		select {
 		case <-conn.close:
@@ -586,6 +668,49 @@ func (conn *Conn) receive(data []byte) error {
 		return nil
 	}
 	return conn.handle(pkData)
+}
+
+func (conn *Conn) receiveMultiple(data [][]byte) error {
+	var packets []*packetData
+	for _, d := range data {
+		pkData, err := parseData(d, conn)
+		if err != nil {
+			return err
+		}
+
+		if pkData.h.PacketID == packet.IDDisconnect {
+			// We always handle disconnect packets and close the connection if one comes in.
+			pks, err := pkData.decode(conn)
+			if err != nil {
+				return err
+			}
+
+			conn.disconnectMessage.Store(&pks[0].(*packet.Disconnect).Message)
+			_ = conn.Close()
+			return nil
+		}
+		if conn.waitingForSpawn.Load() && pkData.h.PacketID == packet.IDPlayerAuthInput {
+			continue
+		}
+		packets = append(packets, pkData)
+	}
+
+	if conn.loggedIn && !conn.waitingForSpawn.Load() {
+		select {
+		case <-conn.close:
+		case conn.packetBatches <- packets:
+		}
+
+		return nil
+	}
+
+	for _, pkData := range packets {
+		if err := conn.handle(pkData); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // handle tries to handle the incoming packetData.
@@ -670,6 +795,7 @@ func (conn *Conn) handlePacket(pk packet.Packet) error {
 // version is not supported, otherwise sending back a NetworkSettings packet.
 func (conn *Conn) handleRequestNetworkSettings(pk *packet.RequestNetworkSettings) error {
 	found := false
+
 	for _, pro := range conn.acceptedProto {
 		if pro.ID() == pk.ClientProtocol {
 			conn.proto = pro
@@ -696,8 +822,15 @@ func (conn *Conn) handleRequestNetworkSettings(pk *packet.RequestNetworkSettings
 		return fmt.Errorf("error sending network settings: %v", err)
 	}
 	_ = conn.Flush()
-	conn.enc.EnableCompression(conn.compression)
-	conn.dec.EnableCompression()
+	conn.enc.EnableCompression(conn.compression, conn.proto.ID() <= 630)
+
+	// Compression/decompression changed in 1.20.60. Protocol 630 is version 1.20.50.
+	if conn.proto.ID() <= 630 {
+		conn.dec.SetCompression(conn.compression)
+	} else {
+		conn.dec.EnableCompression()
+	}
+
 	return nil
 }
 
@@ -707,8 +840,15 @@ func (conn *Conn) handleNetworkSettings(pk *packet.NetworkSettings) error {
 	if !ok {
 		return fmt.Errorf("unknown compression algorithm: %v", pk.CompressionAlgorithm)
 	}
-	conn.enc.EnableCompression(alg)
-	conn.dec.EnableCompression()
+	conn.enc.EnableCompression(alg, conn.proto.ID() <= 630)
+
+	// Compression/decompression changed in 1.20.60. Protocol 630 is version 1.20.50.
+	if conn.proto.ID() <= 630 {
+		conn.dec.SetCompression(alg)
+	} else {
+		conn.dec.EnableCompression()
+	}
+
 	conn.readyToLogin = true
 	return nil
 }
@@ -716,6 +856,25 @@ func (conn *Conn) handleNetworkSettings(pk *packet.NetworkSettings) error {
 // handleLogin handles an incoming login packet. It verifies and decodes the login request found in the packet
 // and returns an error if it couldn't be done successfully.
 func (conn *Conn) handleLogin(pk *packet.Login) error {
+	found := false
+	for _, pro := range conn.acceptedProto {
+		if pro.ID() == pk.ClientProtocol {
+			conn.proto = pro
+			conn.pool = pro.Packets(true)
+			found = true
+			break
+		}
+	}
+	if !found {
+		status := packet.PlayStatusLoginFailedClient
+		if pk.ClientProtocol > protocol.CurrentProtocol {
+			// The server is outdated in this case, so we have to change the status we send.
+			status = packet.PlayStatusLoginFailedServer
+		}
+		_ = conn.WritePacket(&packet.PlayStatus{Status: status})
+		return fmt.Errorf("%v connected with an incompatible protocol: expected protocol = %v, client protocol = %v", conn.identityData.DisplayName, protocol.CurrentProtocol, pk.ClientProtocol)
+	}
+
 	// The next expected packet is a response from the client to the handshake.
 	conn.expect(packet.IDClientToServerHandshake)
 	var (
@@ -819,8 +978,8 @@ func (conn *Conn) handleServerToClientHandshake(pk *packet.ServerToClientHandsha
 	keyBytes := sha256.Sum256(append(salt, sharedSecret...))
 
 	// Finally we enable encryption for the enc and dec using the secret pubKey bytes we produced.
-	conn.enc.EnableEncryption(keyBytes)
-	conn.dec.EnableEncryption(keyBytes)
+	conn.enc.EnableEncryption(conn.proto.Encryption(keyBytes))
+	conn.dec.EnableEncryption(conn.proto.Encryption(keyBytes))
 
 	// We write a ClientToServerHandshake packet (which has no payload) as a response.
 	_ = conn.WritePacket(&packet.ClientToServerHandshake{})
@@ -1402,8 +1561,8 @@ func (conn *Conn) enableEncryption(clientPublicKey *ecdsa.PublicKey) error {
 	keyBytes := sha256.Sum256(append(conn.salt, sharedSecret...))
 
 	// Finally we enable encryption for the encoder and decoder using the secret key bytes we produced.
-	conn.enc.EnableEncryption(keyBytes)
-	conn.dec.EnableEncryption(keyBytes)
+	conn.enc.EnableEncryption(conn.proto.Encryption(keyBytes))
+	conn.dec.EnableEncryption(conn.proto.Encryption(keyBytes))
 
 	return nil
 }
