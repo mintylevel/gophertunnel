@@ -11,13 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
-	rand2 "math/rand"
-	"net"
-	"os"
-	"strconv"
-	"strings"
-	"time"
 
 	"github.com/go-jose/go-jose/v3/jwt"
 	"github.com/google/uuid"
