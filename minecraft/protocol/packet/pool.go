@@ -251,6 +251,7 @@ func init() {
 		IDSetPlayerInventoryOptions:      func() Packet { return &SetPlayerInventoryOptions{} },
 		IDSetHud:                         func() Packet { return &SetHud{} },
 		IDAwardAchievement:               func() Packet { return &AwardAchievement{} },
+		IDClientBoundCloseForm:           func() Packet { return &ClientBoundCloseForm{} },
 	}
 	for id, pk := range serverOriginating {
 		RegisterPacketFromServer(id, pk)
@@ -285,6 +286,7 @@ func init() {
 		IDMapInfoRequest:                  func() Packet { return &MapInfoRequest{} },
 		IDRequestChunkRadius:              func() Packet { return &RequestChunkRadius{} },
 		IDBossEvent:                       func() Packet { return &BossEvent{} },
+		IDShowCredits:                 	   func() Packet { return &ShowCredits{} },
 		IDCommandRequest:                  func() Packet { return &CommandRequest{} },
 		IDCommandBlockUpdate:              func() Packet { return &CommandBlockUpdate{} },
 		IDResourcePackChunkRequest:        func() Packet { return &ResourcePackChunkRequest{} },
