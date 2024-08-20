@@ -1,8 +1,9 @@
 package protocol
 
 import (
-	"github.com/go-gl/mathgl/mgl32"
 	"image/color"
+
+	"github.com/go-gl/mathgl/mgl32"
 )
 
 const (
@@ -72,6 +73,9 @@ type CameraInstructionSet struct {
 	Rotation Optional[mgl32.Vec2]
 	// Facing is a vector that the camera will always face towards during the duration of the instruction.
 	Facing Optional[mgl32.Vec3]
+	// ViewOffset is an offset based on a pivot point to the player, causing the camera to be shifted in a
+	// certain direction.
+	ViewOffset Optional[mgl32.Vec2]
 	// Default determines whether the camera is a default camera or not.
 	Default Optional[bool]
 }
@@ -83,6 +87,7 @@ func (x *CameraInstructionSet) Marshal(r IO) {
 	OptionalFunc(r, &x.Position, r.Vec3)
 	OptionalFunc(r, &x.Rotation, r.Vec2)
 	OptionalFunc(r, &x.Facing, r.Vec3)
+	OptionalFunc(r, &x.ViewOffset, r.Vec2)
 	OptionalFunc(r, &x.Default, r.Bool)
 }
 
@@ -148,12 +153,14 @@ type CameraPreset struct {
 	RotX Optional[float32]
 	// RotY is the default yaw of the camera.
 	RotY Optional[float32]
-	// ViewOffset ...
+	// ViewOffset is only used in a follow_orbit camera and controls an offset based on a pivot point to the
+	// player, causing it to be shifted in a certain direction.
 	ViewOffset Optional[mgl32.Vec2]
-	// Radius ...
+	// Radius is only used in a follow_orbit camera and controls how far away from the player the camera should
+	// be rendered.
 	Radius Optional[float32]
-	// AudioListener defines where the audio should be played from when using this preset. This is one of the constants
-	// above.
+	// AudioListener defines where the audio should be played from when using this preset. This is one of the
+	// constants above.
 	AudioListener Optional[byte]
 	// PlayerEffects is currently unknown.
 	PlayerEffects Optional[bool]
