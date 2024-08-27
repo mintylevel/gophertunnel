@@ -362,11 +362,7 @@ func (listener *Listener) handleConn(conn *Conn) {
 		if conn.readBatches {
 			loggedInBefore := conn.loggedIn
 			if err := conn.receiveMultiple(packets); err != nil {
-<<<<<<< HEAD
 				listener.cfg.ErrorLog.Printf("error: %v", err)
-=======
-				conn.log.Printf("listener conn: %v\n", err)
->>>>>>> upstream/master
 				return
 			}
 			if !loggedInBefore && conn.loggedIn {
