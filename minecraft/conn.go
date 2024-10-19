@@ -1067,7 +1067,7 @@ func (conn *Conn) handleResourcePackStack(pk *packet.ResourcePackStack) error {
 			}
 		}
 		if !conn.hasPack(pack.UUID, pack.Version, false) {
-			return fmt.Errorf("texture pack (UUID=%v, version=%v) not downloaded", pack.UUID, pack.Version)
+			//return fmt.Errorf("texture pack (UUID=%v, version=%v) not downloaded", pack.UUID, pack.Version)
 		}
 	}
 	for _, pack := range pk.BehaviourPacks {
