@@ -982,8 +982,8 @@ func (conn *Conn) handleResourcePacksInfo(pk *packet.ResourcePacksInfo) error {
 			continue
 		}
 		// This UUID_Version is a hack Mojang put in place.
-		packsToDownload = append(packsToDownload, pack.UUID+"_"+pack.Version)
-		conn.packQueue.downloadingPacks[pack.UUID] = downloadingPack{
+		packsToDownload = append(packsToDownload, id+"_"+pack.Version)
+		conn.packQueue.downloadingPacks[id] = downloadingPack{
 			size:       pack.Size,
 			buf:        bytes.NewBuffer(make([]byte, 0, pack.Size)),
 			newFrag:    make(chan []byte),
