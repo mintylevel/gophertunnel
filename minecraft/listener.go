@@ -64,6 +64,10 @@ type ListenConfig struct {
 	// calls to `(*Conn).Write()` or `(*Conn).WritePacket()` to send the packets over network.
 	FlushRate time.Duration
 
+	// ReadBatches determines whether packets should be retrieved in conn's batches. When enabled, the conn.ReadBatch()
+	// function should be used as opposed to conn.ReadPacket()
+	ReadBatches bool
+
 	// ResourcePacks is a slice of resource packs that the listener may hold. Each client will be asked to
 	// download these resource packs upon joining.
 	// Use Listener.AddResourcePack() to add a resource pack and Listener.RemoveResourcePack() to remove a resource pack
@@ -192,7 +196,7 @@ func (listener *Listener) AddResourcePack(pack *resource.Pack) {
 func (listener *Listener) RemoveResourcePack(uuid string) {
 	listener.packsMu.Lock()
 	listener.packs = slices.DeleteFunc(listener.packs, func(pack *resource.Pack) bool {
-		return pack.UUID().String() == uuid
+		return pack.UUID() == uuid
 	})
 	listener.packsMu.Unlock()
 }
@@ -256,7 +260,7 @@ func (listener *Listener) createConn(netConn net.Conn) {
 	packs := slices.Clone(listener.packs)
 	listener.packsMu.RUnlock()
 
-	conn := newConn(netConn, listener.key, listener.cfg.ErrorLog, proto{}, listener.cfg.FlushRate, true)
+	conn := newConn(netConn, listener.key, listener.cfg.ErrorLog, proto{}, listener.cfg.FlushRate, true, listener.cfg.ReadBatches)
 	conn.acceptedProto = append(listener.cfg.AcceptedProtocols, proto{})
 	conn.compression = listener.cfg.Compression
 	conn.pool = conn.proto.Packets(true)
@@ -309,12 +313,36 @@ func (listener *Listener) handleConn(conn *Conn) {
 			}
 			return
 		}
+
+		if conn.readBatches {
+			loggedInBefore := conn.loggedIn
+			if err := conn.receiveMultiple(packets); err != nil {
+				listener.cfg.ErrorLog.Error(err.Error())
+				return
+			}
+			if !loggedInBefore && conn.loggedIn {
+				select {
+				case <-listener.close:
+					// The listener was closed while this one was logged in, so the incoming channel will be
+					// closed. Just return so the connection is closed and cleaned up.
+					return
+				case listener.incoming <- conn:
+					// The connection was previously not logged in, but was after receiving this packet,
+					// meaning the connection is fully completely now. We add it to the channel so that
+					// a call to Accept() can receive it.
+				}
+			}
+
+			continue
+		}
+
 		for _, data := range packets {
 			loggedInBefore := conn.loggedIn
 			if err := conn.receive(data); err != nil {
 				conn.log.Error(err.Error())
 				return
 			}
+
 			if !loggedInBefore && conn.loggedIn {
 				select {
 				case <-listener.close:
