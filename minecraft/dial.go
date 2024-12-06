@@ -87,6 +87,10 @@ type Dialer struct {
 	// calls to `(*Conn).Write()` or `(*Conn).WritePacket()` to send the packets over network.
 	FlushRate time.Duration
 
+	// ReadBatches determines whether packets should be retrieved in conn's batches. When enabled, the conn.ReadBatch()
+	// function should be used as opposed to conn.ReadPacket()
+	ReadBatches bool
+
 	// EnableClientCache, if set to true, enables the client blob cache for the client. This means that the
 	// server will send chunks as blobs, which may be saved by the client so that chunks don't have to be
 	// transmitted every time, resulting in less network transmission.
@@ -185,7 +189,7 @@ func (d Dialer) DialContext(ctx context.Context, network, address string) (conn 
 		return nil, err
 	}
 
-	conn = newConn(netConn, key, d.ErrorLog, d.Protocol, d.FlushRate, false)
+	conn = newConn(netConn, key, d.ErrorLog, d.Protocol, d.FlushRate, false, d.ReadBatches)
 	conn.pool = conn.proto.Packets(false)
 	conn.identityData = d.IdentityData
 	conn.clientData = d.ClientData
@@ -299,6 +303,28 @@ func listenConn(conn *Conn, readyForLogin, connected chan struct{}, cancel conte
 			}
 			return
 		}
+
+		if conn.readBatches {
+			loggedInBefore, readyToLoginBefore := conn.loggedIn, conn.readyToLogin
+			if err := conn.receiveMultiple(packets); err != nil {
+				conn.log.Error(err.Error())
+				return
+			}
+
+			if !readyToLoginBefore && conn.readyToLogin {
+				// This is the signal that the connection is ready to login, so we put a value in the channel so that
+				// it may be detected.
+				readyForLogin <- struct{}{}
+			}
+			if !loggedInBefore && conn.loggedIn {
+				// This is the signal that the connection was considered logged in, so we put a value in the channel so
+				// that it may be detected.
+				cancelContext = false
+				connected <- struct{}{}
+			}
+			continue
+		}
+
 		for _, data := range packets {
 			loggedInBefore, readyToLoginBefore := conn.loggedIn, conn.readyToLogin
 			if err := conn.receive(data); err != nil {
