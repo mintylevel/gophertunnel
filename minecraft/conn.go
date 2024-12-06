@@ -22,6 +22,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -84,6 +85,11 @@ type Conn struct {
 	// packets is a channel of byte slices containing serialised packets that are coming in from the other
 	// side of the connection.
 	packets chan *packetData
+
+	// packetBatches is a channel of byte slices containing a list of serialised packets that are coming in from the
+	// side of the connection.
+	packetBatches chan []*packetData
+	readBatches   bool
 
 	deferredPacketMu sync.Mutex
 	// deferredPackets is a list of packets that were pushed back during the login sequence because they
@@ -148,21 +154,23 @@ type Conn struct {
 // Minecraft packets to that net.Conn.
 // newConn accepts a private key which will be used to identify the connection. If a nil key is passed, the
 // key is generated.
-func newConn(netConn net.Conn, key *ecdsa.PrivateKey, log *slog.Logger, proto Protocol, flushRate time.Duration, limits bool) *Conn {
+func newConn(netConn net.Conn, key *ecdsa.PrivateKey, log *slog.Logger, proto Protocol, flushRate time.Duration, limits bool, readBatches bool) *Conn {
 	conn := &Conn{
-		enc:          packet.NewEncoder(netConn),
-		dec:          packet.NewDecoder(netConn),
-		salt:         make([]byte, 16),
-		packets:      make(chan *packetData, 8),
-		additional:   make(chan packet.Packet, 16),
-		close:        make(chan struct{}),
-		spawn:        make(chan struct{}),
-		conn:         netConn,
-		privateKey:   key,
-		log:          log.With("raddr", netConn.RemoteAddr().String()),
-		hdr:          &packet.Header{},
-		proto:        proto,
-		readerLimits: limits,
+		enc:           packet.NewEncoder(netConn),
+		dec:           packet.NewDecoder(netConn),
+		salt:          make([]byte, 16),
+		packets:       make(chan *packetData, 8),
+		packetBatches: make(chan []*packetData, 8),
+		additional:    make(chan packet.Packet, 16),
+		close:         make(chan struct{}),
+		spawn:         make(chan struct{}),
+		conn:          netConn,
+		privateKey:    key,
+		log:           log.With("raddr", netConn.RemoteAddr().String()),
+		hdr:           &packet.Header{},
+		proto:         proto,
+		readerLimits:  limits,
+		readBatches:   readBatches,
 	}
 	var s string
 	conn.disconnectMessage.Store(&s)
@@ -393,6 +401,67 @@ func (conn *Conn) ReadPacket() (pk packet.Packet, err error) {
 	}
 }
 
+// ReadBatch reads a packet batch from the Conn. If a read deadline is set, an error is returned if the deadline is reached before any
+// packet is received. ReadBatch must not be called on multiple goroutines simultaneously.
+//
+// If the packet read was not implemented, a *packet.Unknown is used, containing the raw payload of the packet read.
+func (conn *Conn) ReadBatch() (pks []packet.Packet, err error) {
+	if !conn.readBatches {
+		return nil, fmt.Errorf("reading batches is disabled")
+	}
+
+	var deferred []packet.Packet
+	for {
+		data, ok := conn.takeDeferredPacket()
+		if !ok {
+			break
+		}
+
+		pk, err := data.decode(conn)
+		if err != nil {
+			conn.log.Error("read packet: " + err.Error())
+			continue
+		}
+
+		if len(pk) == 0 {
+			continue
+		}
+
+		deferred = append(deferred, pk...)
+	}
+
+	if len(deferred) > 0 {
+		return deferred, nil
+	}
+
+	select {
+	case <-conn.close:
+		return nil, conn.closeErr("read batch")
+	case <-conn.readDeadline:
+		return nil, conn.wrap(context.DeadlineExceeded, "read batch")
+	case batch := <-conn.packetBatches:
+		for _, data := range batch {
+			pk, err := data.decode(conn)
+			if err != nil {
+				conn.log.Error("read packet: " + err.Error())
+				continue
+			}
+
+			if len(pk) == 0 {
+				continue
+			}
+
+			pks = append(pks, pk...)
+		}
+
+		if len(pks) == 0 {
+			return conn.ReadBatch()
+		}
+
+		return pks, nil
+	}
+}
+
 // ResourcePacks returns a slice of all resource packs the connection holds. For a Conn obtained using a
 // Listener, this holds all resource packs set to the Listener. For a Conn obtained using Dial, the resource
 // packs include all packs sent by the server connected to.
@@ -609,6 +678,49 @@ func (conn *Conn) receive(data []byte) error {
 	return conn.handle(pkData)
 }
 
+func (conn *Conn) receiveMultiple(data [][]byte) error {
+	var packets []*packetData
+	for _, d := range data {
+		pkData, err := parseData(d, conn)
+		if err != nil {
+			return err
+		}
+
+		if pkData.h.PacketID == packet.IDDisconnect {
+			// We always handle disconnect packets and close the connection if one comes in.
+			pks, err := pkData.decode(conn)
+			if err != nil {
+				return err
+			}
+
+			conn.disconnectMessage.Store(&pks[0].(*packet.Disconnect).Message)
+			_ = conn.Close()
+			return nil
+		}
+		if conn.waitingForSpawn.Load() && pkData.h.PacketID == packet.IDPlayerAuthInput {
+			continue
+		}
+		packets = append(packets, pkData)
+	}
+
+	if conn.loggedIn && !conn.waitingForSpawn.Load() {
+		select {
+		case <-conn.close:
+		case conn.packetBatches <- packets:
+		}
+
+		return nil
+	}
+
+	for _, pkData := range packets {
+		if err := conn.handle(pkData); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // handle tries to handle the incoming packetData.
 func (conn *Conn) handle(pkData *packetData) error {
 	for _, id := range conn.expectedIDs.Load().([]uint32) {
@@ -776,7 +888,7 @@ func (conn *Conn) handleClientToServerHandshake() error {
 		}
 		if pack.Encrypted() {
 			texturePack.ContentKey = pack.ContentKey()
-			texturePack.ContentIdentity = pack.Manifest().Header.UUID.String()
+			texturePack.ContentIdentity = pack.Manifest().Header.UUID
 		}
 		pk.TexturePacks = append(pk.TexturePacks, texturePack)
 	}
@@ -855,23 +967,22 @@ func (conn *Conn) handleResourcePacksInfo(pk *packet.ResourcePacksInfo) error {
 	packsToDownload := make([]string, 0, totalPacks)
 
 	for index, pack := range pk.TexturePacks {
-		id := pack.UUID.String()
-		if _, ok := conn.packQueue.downloadingPacks[id]; ok {
+		if _, ok := conn.packQueue.downloadingPacks[pack.UUID]; ok {
 			conn.log.Warn("handle ResourcePacksInfo: duplicate texture pack", "UUID", pack.UUID)
 			conn.packQueue.packAmount--
 			continue
 		}
-		if conn.downloadResourcePack != nil && !conn.downloadResourcePack(uuid.MustParse(id), pack.Version, index, totalPacks) {
+		if conn.downloadResourcePack != nil && !conn.downloadResourcePack(uuid.MustParse(pack.UUID), pack.Version, index, totalPacks) {
 			conn.ignoredResourcePacks = append(conn.ignoredResourcePacks, exemptedResourcePack{
-				uuid:    id,
+				uuid:    pack.UUID,
 				version: pack.Version,
 			})
 			conn.packQueue.packAmount--
 			continue
 		}
 		// This UUID_Version is a hack Mojang put in place.
-		packsToDownload = append(packsToDownload, id+"_"+pack.Version)
-		conn.packQueue.downloadingPacks[id] = downloadingPack{
+		packsToDownload = append(packsToDownload, pack.UUID+"_"+pack.Version)
+		conn.packQueue.downloadingPacks[pack.UUID] = downloadingPack{
 			size:       pack.Size,
 			buf:        bytes.NewBuffer(make([]byte, 0, pack.Size)),
 			newFrag:    make(chan []byte),
@@ -940,7 +1051,7 @@ func (conn *Conn) hasPack(uuid string, version string, hasBehaviours bool) bool 
 		}
 	}
 	for _, pack := range conn.resourcePacks {
-		if pack.UUID().String() == uuid && pack.Version() == version && pack.HasBehaviours() == hasBehaviours {
+		if pack.UUID() == uuid && pack.Version() == version && pack.HasBehaviours() == hasBehaviours {
 			return true
 		}
 	}
@@ -972,7 +1083,7 @@ func (conn *Conn) handleResourcePackClientResponse(pk *packet.ResourcePackClient
 	case packet.PackResponseAllPacksDownloaded:
 		pk := &packet.ResourcePackStack{BaseGameVersion: protocol.CurrentVersion, Experiments: []protocol.ExperimentData{{Name: "cameras", Enabled: true}}}
 		for _, pack := range conn.resourcePacks {
-			resourcePack := protocol.StackResourcePack{UUID: pack.UUID().String(), Version: pack.Version()}
+			resourcePack := protocol.StackResourcePack{UUID: pack.UUID(), Version: pack.Version()}
 			// If it has behaviours, add it to the behaviour pack list. If not, we add it to the texture packs
 			// list.
 			if pack.HasBehaviours() {
@@ -1159,7 +1270,7 @@ func (conn *Conn) handleResourcePackChunkData(pk *packet.ResourcePackChunkData) 
 // pack to be downloaded.
 func (conn *Conn) handleResourcePackChunkRequest(pk *packet.ResourcePackChunkRequest) error {
 	current := conn.packQueue.currentPack
-	if current.UUID().String() != pk.UUID {
+	if current.UUID() != pk.UUID {
 		return fmt.Errorf("expected pack UUID %v, but got %v", current.UUID(), pk.UUID)
 	}
 	if conn.packQueue.currentOffset != uint64(pk.ChunkIndex)*packChunkSize {
@@ -1199,6 +1310,10 @@ func (conn *Conn) handleResourcePackChunkRequest(pk *packet.ResourcePackChunkReq
 // handleStartGame handles an incoming StartGame packet. It is the signal that the player has been added to a
 // world, and it obtains most of its dedicated properties.
 func (conn *Conn) handleStartGame(pk *packet.StartGame) error {
+	if matched, _ := regexp.MatchString(`.*\.hivebedrock\.network.*`, conn.clientData.ServerAddress); matched {
+		pk.BaseGameVersion = "1.17.0"
+		fmt.Println("hive")
+	}
 	conn.gameData = GameData{
 		Difficulty:                   pk.Difficulty,
 		WorldName:                    pk.WorldName,
