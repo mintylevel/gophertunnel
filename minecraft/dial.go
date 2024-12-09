@@ -231,12 +231,28 @@ func (d Dialer) DialContext(ctx context.Context, network, address string) (conn 
 	if err := conn.WritePacket(&packet.RequestNetworkSettings{ClientProtocol: d.Protocol.ID()}); err != nil {
 		return nil, conn.wrap(fmt.Errorf("send request network settings: %w", err), "dial")
 	}
-	_ = conn.Flush()
+	
+	fchan := make(chan bool, 1)
+	if d.FlushRate < 0 {
+		go func() {
+			t := time.NewTicker(time.Millisecond * 250)
+			for {
+				select {
+				case <-t.C:
+					conn.Flush()
+				case <-fchan:
+					return
+				}
+			}
+		}()
+	}
 
 	select {
 	case <-ctx.Done():
+		fchan <- true
 		return nil, conn.wrap(context.Cause(ctx), "dial")
 	case <-conn.close:
+		fchan <- true
 		return nil, conn.closeErr("dial")
 	case <-readyForLogin:
 		// We've received our network settings, so we can now send our login request.
@@ -248,11 +264,14 @@ func (d Dialer) DialContext(ctx context.Context, network, address string) (conn 
 
 		select {
 		case <-ctx.Done():
+			fchan <- true
 			return nil, conn.wrap(context.Cause(ctx), "dial")
 		case <-conn.close:
+			fchan <- true
 			return nil, conn.closeErr("dial")
 		case <-connected:
 			// We've connected successfully. We return the connection and no error.
+			fchan <- true
 			return conn, nil
 		}
 	}
